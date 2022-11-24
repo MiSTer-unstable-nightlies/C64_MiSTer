@@ -10,7 +10,7 @@ module sid_top
 	input         clk,
 	input         ce_1m,
 
-	input [N-1:0] cs,       // not used if DUAL is 0
+	input [N-1:0] cs,
 	input         we,
 	input   [4:0] addr,
 	input   [7:0] data_in,
@@ -80,8 +80,7 @@ wire [11:0] acc_t[N*3];
 
 reg  [17:0] audio[N];
 
-reg         dac_mode[N];
-reg   [7:0] last_wr[N];
+reg   [7:0] bus_data[N];
 
 generate
 	genvar i;
@@ -174,9 +173,9 @@ generate
 				Filter_Res_Filt[i] <= 0;
 				Filter_Mode_Vol[i] <= 0;
 			end
-			else begin
-				if (we && (!DUAL || cs[i])) begin
-					last_wr[i] <= data_in;
+			else if(cs[i]) begin
+				if (we) begin
+					bus_data[i] <= data_in;
 					case (addr)
 						5'h00: Voice_1_Freq[i][7:0] <= data_in;
 						5'h01: Voice_1_Freq[i][15:8]<= data_in;
@@ -205,20 +204,21 @@ generate
 						5'h18: Filter_Mode_Vol[i]   <= data_in;
 					endcase
 				end
-				
-				dac_mode[i] <= ((Voice_1_Control[i] & 8'hf9) == 8'h49 && (Voice_2_Control[i] & 8'hf9) == 8'h49 && (Voice_3_Control[i] & 8'hf9) == 8'h49);
+				else begin
+					case (addr)
+						5'h19: bus_data[i] = i ? pot_x_r : pot_x_l;
+						5'h1a: bus_data[i] = i ? pot_y_r : pot_y_l;
+						5'h1b: bus_data[i] = Misc_Osc3[i];
+						5'h1c: bus_data[i] = Misc_Env3[i];
+					endcase
+				end
 			end
 		end
 	end
 endgenerate
 
-reg   [7:0] dac_addr;
-reg  [17:0] dac_out[N];
-
 wire [15:0] F0;
-wire [17:0] dac_o;
-
-wire n = DUAL ? state[3] : 1'd0;
+wire n = DUAL && state[3];
 
 sid_tables #(MULTI_FILTERS) sid_tables
 (
@@ -237,11 +237,43 @@ sid_tables #(MULTI_FILTERS) sid_tables
 	.ld_clk(ld_clk),
 	.ld_addr(ld_addr),
 	.ld_data(ld_data),
-	.ld_wr(ld_wr),
-	
-	.dac_addr(dac_addr),
-	.dac_dout(dac_o)
+	.ld_wr(ld_wr)
 );
+
+wire  [7:0] f__st_out;
+wire  [7:0] f_p_t_out;
+wire  [7:0] f_ps__out;
+wire  [7:0] f_pst_out;
+reg  [11:0] f_acc_t;
+reg   [3:0] state;
+
+always @(posedge clk) begin
+	reg [2:0] v;
+	if(~&state) state <= state + 1'd1;
+	if(ce_1m) state <= 0;
+
+	case(state)
+		1,3,5,7,9,11: begin
+			f_acc_t <= acc_t[state[3:1]];
+			v <= state[3:1];
+		end
+	endcase
+
+	case(state)
+		3,5,7: begin
+			_st_out[v] <= f__st_out;
+			p_t_out[v] <= f_p_t_out;
+			ps__out[v] <= f_ps__out;
+			pst_out[v] <= f_pst_out;
+		end
+		9,11,13: if(DUAL) begin
+			_st_out[v] <= f__st_out;
+			p_t_out[v] <= f_p_t_out;
+			ps__out[v] <= f_ps__out;
+			pst_out[v] <= f_pst_out;
+		end
+	endcase
+end
 
 wire [17:0] faudio;
 
@@ -257,61 +289,10 @@ sid_filter sid_filter
 	.voice1(voice_1[n]),
 	.voice2(voice_2[n]),
 	.voice3(voice_3[n]),
-	.ext_in(n ? 22'(signed'(ext_in_r)) : 22'(signed'(ext_in_l))),
+	.ext_in(22'(signed'({n ? ext_in_r : ext_in_l, 3'b000}))),
 
 	.audio(faudio)
 );
-
-wire  [7:0] f__st_out;
-wire  [7:0] f_p_t_out;
-wire  [7:0] f_ps__out;
-wire  [7:0] f_pst_out;
-reg  [11:0] f_acc_t;
-reg   [3:0] state;
-
-always @(posedge clk) begin
-	reg [17:0] dac_t;
-	
-	if(~&state) state <= state + 1'd1;
-	if(ce_1m) state <= 0;
-
-	case(state)
-		1,3,5,7,9,11: begin
-			f_acc_t  <= acc_t[state[3:1]];
-		end
-	endcase
-
-	case(state)
-		3,5,7: begin
-			_st_out[state[3:1]-1'd1] <= f__st_out;
-			p_t_out[state[3:1]-1'd1] <= f_p_t_out;
-			ps__out[state[3:1]-1'd1] <= f_ps__out;
-			pst_out[state[3:1]-1'd1] <= f_pst_out;
-		end
-		9,11,13: if(DUAL) begin
-			_st_out[state[3:1]-1'd1] <= f__st_out;
-			p_t_out[state[3:1]-1'd1] <= f_p_t_out;
-			ps__out[state[3:1]-1'd1] <= f_ps__out;
-			pst_out[state[3:1]-1'd1] <= f_pst_out;
-		end
-	endcase
-	
-	case(state)
-		1,7: begin dac_addr <= Filter_Mode_Vol[state[2]]; end
-		  6: dac_t <= dac_o;
-		 12: begin dac_out[0] <= dac_t; if(DUAL) dac_out[1] <= dac_o; end
-	endcase
-end
-
-always_comb begin
-	case (addr)
-		  5'h19: data_out = (!DUAL || cs[0]) ? pot_x_l : pot_x_r;
-		  5'h1a: data_out = (!DUAL || cs[0]) ? pot_y_l : pot_y_r;
-		  5'h1b: data_out = Misc_Osc3[|DUAL & ~cs[0]];
-		  5'h1c: data_out = Misc_Env3[|DUAL & ~cs[0]];
-		default: data_out = last_wr[|DUAL & ~cs[0]];
-	endcase
-end
 
 always @(posedge clk) begin
 	reg [17:0] audio0;
@@ -322,7 +303,9 @@ always @(posedge clk) begin
 	end
 end
 
-assign audio_l = dac_mode[0] ? dac_out[0] : audio[0];
-assign audio_r = (!DUAL) ? audio_l : dac_mode[1] ? dac_out[1] : audio[1];
+assign data_out = cs[0] ? bus_data[0] : bus_data[N-1];
+
+assign audio_l = audio[0];
+assign audio_r = audio[N-1];
 
 endmodule
