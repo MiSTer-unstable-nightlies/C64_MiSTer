@@ -46,6 +46,7 @@ entity video_vicii_656x is
 		turbo_en   : in  std_logic;
 		turbo_state: out std_logic;
 
+		variant : in std_logic_vector(1 downto 0); -- 00 - NMOS, 01 - HMOS, 10 - old HMOS
 		reset : in std_logic;
 		cs : in std_logic;
 		we : in std_logic;
@@ -135,8 +136,11 @@ architecture rtl of video_vicii_656x is
 
 	-- mode
 	signal BMM: std_logic; -- Bitmap mode
+	signal BMMDelay: std_logic;
 	signal ECM: std_logic; -- Extended color mode
+	signal ECMDelay: std_logic;
 	signal MCM: std_logic; -- Multi color mode
+	signal MCMDelay: std_logic;
 	signal DEN: std_logic; -- DMA enable
 	signal RSEL: std_logic; -- Visible rows selection (24/25)
 	signal CSEL: std_logic; -- Visible columns selection (38/40)
@@ -224,8 +228,10 @@ architecture rtl of video_vicii_656x is
 	signal waitingPixels_r : unsigned(7 downto 0);
 	-- Stores colorinfo and the Pixels that are currently in shift register
 	signal shiftingChar : unsigned(11 downto 0);
+	signal shiftingChar_d : unsigned(11 downto 0);
 	signal shiftingPixels : unsigned(7 downto 0);
 	signal currentPixels : unsigned(1 downto 0);
+	signal currentPixels_d : unsigned(1 downto 0);
 	signal shifting_ff : std_logic; -- Multicolor shift-regiter status bit.
 
 -- Sprite work registers
@@ -249,7 +255,6 @@ architecture rtl of video_vicii_656x is
 	signal MCurrentPixel : MCurrentPixelDef;
 
 -- Current colors and pixels
-	signal pixelColor: ColorDef;
 	signal pixelBgFlag: std_logic; -- For collision detection
 
 -- Read/Write lines
@@ -975,7 +980,7 @@ calcBorders: process(clk)
 -- Pixel generator for Text/Bitmap screen
 -- -----------------------------------------------------------------------
 calcBitmap: process(clk)
-		variable multiColor : std_logic;
+	variable multiColor : std_logic;
 	begin
 		if rising_edge(clk) then
 			if enaPixel = '1' then
@@ -1015,57 +1020,11 @@ calcBitmap: process(clk)
 				-- Calculate if pixel is in foreground or background
 				pixelBgFlag <= currentPixels(1);
 
-				--
-				-- Calculate color of next pixel				
-				pixelColor <= B0C;
-				if (BMM = '0') and (ECM='0') then
-					if (multiColor = '0') then
-						-- normal character mode
-						if currentPixels(1) = '1' then
-							pixelColor <= shiftingChar(11 downto 8);
-						end if;
-					else
-						-- multi-color character mode
-						case currentPixels is
-						when "01" => pixelColor <= B1C;
-						when "10" => pixelColor <= B2C;
-						when "11" => pixelColor <= '0' & shiftingChar(10 downto 8);
-						when others => null;
-						end case;
-					end if;
-				elsif (MCM = '0') and (BMM = '0') and (ECM='1') then
-					-- extended-color character mode
-					-- multiple background colors but only 64 characters
-					if currentPixels(1) = '1' then
-						pixelColor <= shiftingChar(11 downto 8);
-					else
-						case shiftingChar(7 downto 6) is
-						when "01" => pixelColor <= B1C;
-						when "10" => pixelColor <= B2C;
-						when "11" => pixelColor <= B3C;
-						when others	=> null;
-						end case;
-					end if;
-				elsif emulateGraphics and (MCM = '0') and (BMM = '1') and (ECM='0') then
-					-- highres bitmap mode
-					if currentPixels(1) = '1' then
-						pixelColor <= shiftingChar(7 downto 4);
-					else
-						pixelColor <= shiftingChar(3 downto 0);
-					end if;
-				elsif emulateGraphics and (MCM = '1') and (BMM = '1') and (ECM='0') then
-					-- Multi-color bitmap mode
-					case currentPixels is
-					when "01" => pixelColor <= shiftingChar(7 downto 4);
-					when "10" => pixelColor <= shiftingChar(3 downto 0);
-					when "11" => pixelColor <= shiftingChar(11 downto 8);
-					when others => null;
-					end case;
-				else
-					-- illegal display mode, the output is black
-					pixelColor <= "0000";
-				end if;
-
+				currentPixels_d <= currentPixels;
+				shiftingChar_d <= shiftingChar;
+				MCMDelay <= MCM;
+				ECMDelay <= ECM;
+				BMMDelay <= BMM;
 			end if;
 
 			--
@@ -1309,6 +1268,8 @@ calcBitmap: process(clk)
 -- -----------------------------------------------------------------------
 
 	process(clk)
+		variable pixelColor: ColorDef;
+		variable multiColor : std_logic;
 		variable myColor: unsigned(3 downto 0);
 		variable muxSprite : unsigned(2 downto 0);
 		variable muxColor : unsigned(1 downto 0);
@@ -1339,6 +1300,61 @@ calcBitmap: process(clk)
 					muxSprite := to_unsigned(i, 3);
 				end if;
 			end loop;
+
+			-- Multicolor mode is active with MCM, but for character
+			-- mode it depends on bit3 of color ram too.
+			multiColor := MCMDelay and (BMMDelay or ECMDelay or shiftingChar_d(11));
+
+			--
+			-- Calculate color of next pixel
+			pixelColor := B0C;
+			if (BMMDelay = '0') and (ECMDelay='0') then
+				if (multiColor = '0') then
+					-- normal character mode
+					if currentPixels_d(1) = '1' then
+						pixelColor := shiftingChar_d(11 downto 8);
+					end if;
+				else
+					-- multi-color character mode
+					case currentPixels_d is
+					when "01" => pixelColor := B1C;
+					when "10" => pixelColor := B2C;
+					when "11" => pixelColor := '0' & shiftingChar_d(10 downto 8);
+					when others => null;
+					end case;
+				end if;
+			elsif (MCMDelay = '0') and (BMMDelay = '0') and (ECMDelay = '1') then
+				-- extended-color character mode
+				-- multiple background colors but only 64 characters
+				if currentPixels_d(1) = '1' then
+					pixelColor := shiftingChar_d(11 downto 8);
+				else
+					case shiftingChar_d(7 downto 6) is
+					when "01" => pixelColor := B1C;
+					when "10" => pixelColor := B2C;
+					when "11" => pixelColor := B3C;
+					when others	=> null;
+					end case;
+				end if;
+			elsif emulateGraphics and (MCMDelay = '0') and (BMMDelay = '1') and (ECMDelay = '0') then
+				-- highres bitmap mode
+				if currentPixels_d(1) = '1' then
+					pixelColor := shiftingChar_d(7 downto 4);
+				else
+					pixelColor := shiftingChar_d(3 downto 0);
+				end if;
+			elsif emulateGraphics and (MCMDelay = '1') and (BMMDelay = '1') and (ECMDelay = '0') then
+				-- Multi-color bitmap mode
+				case currentPixels_d is
+				when "01" => pixelColor := shiftingChar_d(7 downto 4);
+				when "10" => pixelColor := shiftingChar_d(3 downto 0);
+				when "11" => pixelColor := shiftingChar_d(11 downto 8);
+				when others => null;
+				end case;
+			else
+				-- illegal display mode, the output is black
+				pixelColor := "0000";
+			end if;
 
 			myColor := pixelColor;
 			case muxColor is
@@ -1551,7 +1567,29 @@ writeRegisters: process(clk)
 				turbo_reg <= '0';
 			else
 
-				if (myWr_phi1 = '1') then
+				if (myWr_phi1 = '1' and (rasterX(1 downto 0) = "00" and enaPixel = '0' and variant = "01")) then
+					-- HMOS versions seems to use the color registers too fast, before they latch the proper value from the bus
+					case aRegisters is
+					when "100000" => EC <= x"F";
+					when "100001" => B0C <= x"F";
+					when "100010" => B1C <= x"F";
+					when "100011" => B2C <= x"F";
+					when "100100" => B3C <= x"F";
+					when "100101" => MM0 <= x"F";
+					when "100110" => MM1 <= x"F";
+					when "100111" => spriteColors(0) <= x"F";
+					when "101000" => spriteColors(1) <= x"F";
+					when "101001" => spriteColors(2) <= x"F";
+					when "101010" => spriteColors(3) <= x"F";
+					when "101011" => spriteColors(4) <= x"F";
+					when "101100" => spriteColors(5) <= x"F";
+					when "101101" => spriteColors(6) <= x"F";
+					when "101110" => spriteColors(7) <= x"F";
+					when others => null;
+					end case;
+				end if;
+
+				if (myWr_phi1 = '1' and (enaPixel = '1' or variant = "10")) then
 					-- assumption: color registers are latched during the whole PHI high cycle
 					case aRegisters is
 					when "100000" => EC <= diRegisters(3 downto 0);
